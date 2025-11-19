@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptrace"
 	"net/url"
@@ -41,6 +42,12 @@ var (
 	extraLongThrottleLatency = 1 * time.Second
 )
 
+type FileField struct {
+	FieldName string // form field name
+	FileName  string
+	Content   io.Reader
+}
+
 type Request struct {
 	c *RESTClient
 
@@ -58,6 +65,11 @@ type Request struct {
 	host       string
 	params     url.Values
 	headers    http.Header
+
+	// multipart upload support
+	fileFields    []FileField       // multifile field
+	textFields    map[string]string // text field
+	multipartMode bool              // if enable multipart mode
 
 	// output
 	err error
@@ -96,6 +108,7 @@ func NewRequest(c *RESTClient) *Request {
 		maxRetries:  10,
 		pathPrefix:  pathPrefix,
 		retryFn:     defaultRequestRetryFn,
+		textFields:  make(map[string]string),
 	}
 
 	switch {
@@ -118,6 +131,25 @@ func (r *Request) Prefix(segments ...string) *Request {
 		return r
 	}
 	r.pathPrefix = path.Join(r.pathPrefix, path.Join(segments...))
+	return r
+}
+
+func (r *Request) AddFileField(fieldName, fileName string, content io.Reader) *Request {
+	r.fileFields = append(r.fileFields, FileField{
+		FieldName: fieldName,
+		FileName:  fileName,
+		Content:   content,
+	})
+	return r
+}
+
+func (r *Request) AddTextField(key, value string) *Request {
+	r.textFields[key] = value
+	return r
+}
+
+func (r *Request) MultipartUpload() *Request {
+	r.multipartMode = true
 	return r
 }
 
@@ -372,15 +404,52 @@ func (r *Request) newHTTPRequest(ctx context.Context) (*http.Request, error) {
 		// Giving each request a dedicated reader allows retries to avoid races resetting the request body.
 		body = bytes.NewReader(r.bodyBytes)
 	}
+	var writer *multipart.Writer
+	if r.multipartMode {
+		buffer := &bytes.Buffer{}
+		writer = multipart.NewWriter(buffer)
+
+		// handle multifile upload
+		if len(r.fileFields) > 0 {
+			for _, fileField := range r.fileFields {
+				part, err := writer.CreateFormFile(fileField.FieldName, fileField.FileName)
+				if err != nil {
+					return nil, fmt.Errorf("error creating form file %s: %w", fileField.FieldName, err)
+				}
+				if _, err = io.Copy(part, fileField.Content); err != nil {
+					return nil, fmt.Errorf("error copying file content for %s: %w", fileField.FieldName, err)
+				}
+			}
+		}
+		// add all text field
+		for key, value := range r.textFields {
+			if err := writer.WriteField(key, value); err != nil {
+				return nil, fmt.Errorf("error writing text field %s: %w", key, err)
+			}
+		}
+
+		if err := writer.Close(); err != nil {
+			return nil, fmt.Errorf("error closing multipart writer: %w", err)
+		}
+		body = buffer
+	}
+
 	Url := r.URL().String()
 	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, newDNSMetricsTrace(ctx)), r.verb, Url, body)
 	if err != nil {
 		return nil, err
 	}
-	req.Header = r.headers
 	if r.host != "" {
 		req.Host = r.host
 	}
+	if r.multipartMode && writer != nil {
+		if r.headers == nil {
+			r.headers = http.Header{}
+		}
+		r.headers.Set("Content-Type", writer.FormDataContentType())
+	}
+
+	req.Header = r.headers
 	return req, nil
 }
 
