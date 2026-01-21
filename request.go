@@ -1,7 +1,6 @@
 package rest
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -20,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tmaxmax/go-sse"
 	"golang.org/x/net/http2"
 	"k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/client-go/util/flowcontrol"
@@ -79,12 +79,6 @@ type Request struct {
 	bodyBytes []byte
 
 	retryFn requestRetryFunc
-
-	// SSE specific fields
-	sseLastEventID   string
-	sseRetryInterval time.Duration
-	sseEventHandler  EventHandler
-	sseBufferSize    int
 }
 
 func NewRequest(c *RESTClient) *Request {
@@ -234,44 +228,6 @@ func (r *Request) RequestURI(uri string) *Request {
 			r.params[k] = v
 		}
 	}
-	return r
-}
-
-// SSE configuration methods for chaining
-
-// WithLastEventID sets the last event ID for SSE reconnection
-func (r *Request) WithLastEventID(lastEventID string) *Request {
-	if r.err != nil {
-		return r
-	}
-	r.sseLastEventID = lastEventID
-	return r
-}
-
-// WithRetryInterval sets the retry interval for SSE connections
-func (r *Request) WithRetryInterval(interval time.Duration) *Request {
-	if r.err != nil {
-		return r
-	}
-	r.sseRetryInterval = interval
-	return r
-}
-
-// WithEventHandler sets the event handler for SSE connections
-func (r *Request) WithEventHandler(handler EventHandler) *Request {
-	if r.err != nil {
-		return r
-	}
-	r.sseEventHandler = handler
-	return r
-}
-
-// WithBufferSize sets the buffer size for SSE event channels
-func (r *Request) WithBufferSize(bufferSize int) *Request {
-	if r.err != nil {
-		return r
-	}
-	r.sseBufferSize = bufferSize
 	return r
 }
 
@@ -697,20 +653,6 @@ func (r Result) Error() error {
 	return r.err
 }
 
-// SSEWatch creates an SSE watcher for streaming events
-func (r *Request) SSEWatch(ctx context.Context) (SSEWatcher, error) {
-	if r.err != nil {
-		return nil, r.err
-	}
-
-	watcher := newSSEWatcher(r)
-	if err := watcher.Start(ctx); err != nil {
-		return nil, err
-	}
-
-	return watcher, nil
-}
-
 // Stream executes the request and returns a streaming result for SSE
 func (r *Request) Stream(ctx context.Context) (*StreamResult, error) {
 	if r.err != nil {
@@ -755,6 +697,28 @@ func (r *Request) Stream(ctx context.Context) (*StreamResult, error) {
 	}, nil
 }
 
+// SSE creates an SSE watcher for streaming events
+func (r *Request) SSE(ctx context.Context, cfg *sse.ReadConfig) (func(func(sse.Event, error) bool), io.Closer, error) {
+	if r.err != nil {
+		return nil, nil, r.err
+	}
+	if r.c.client == nil {
+		r.c.client = http.DefaultClient
+	}
+
+	var err error
+	req, err := r.newHTTPRequest(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	resp, err := r.c.client.Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return sse.Read(resp.Body, cfg), resp.Body, nil
+}
+
 // StreamResult represents a streaming HTTP response
 type StreamResult struct {
 	resp *http.Response
@@ -771,73 +735,4 @@ func (sr *StreamResult) Close() error {
 		return sr.resp.Body.Close()
 	}
 	return nil
-}
-
-// ReadEvent reads the next SSE event from the stream
-func (sr *StreamResult) ReadEvent() (*Event, error) {
-	if sr.resp == nil || sr.resp.Body == nil {
-		return nil, fmt.Errorf("no response body available")
-	}
-
-	reader := bufio.NewReader(sr.resp.Body)
-
-	event := &Event{
-		Type:      EventTypeData,
-		Timestamp: time.Now(),
-	}
-
-	var dataLines []string
-
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			return nil, err
-		}
-
-		line = strings.TrimRight(line, "\r\n")
-
-		// Empty line indicates end of event
-		if line == "" {
-			break
-		}
-
-		// Skip comments
-		if strings.HasPrefix(line, ":") {
-			continue
-		}
-
-		// Parse field
-		if colonIndex := strings.Index(line, ":"); colonIndex != -1 {
-			field := line[:colonIndex]
-			value := strings.TrimSpace(line[colonIndex+1:])
-
-			switch field {
-			case "event":
-				event.Type = EventType(value)
-			case "data":
-				dataLines = append(dataLines, value)
-			case "id":
-				event.ID = value
-			case "retry":
-				if retry, err := strconv.Atoi(value); err == nil {
-					event.Retry = retry
-				}
-			}
-		} else {
-			// Field without value
-			switch line {
-			case "data":
-				dataLines = append(dataLines, "")
-			}
-		}
-	}
-
-	// Join data lines
-	if len(dataLines) > 0 {
-		event.Raw = []byte(strings.Join(dataLines, "\n"))
-		return event, nil
-	}
-
-	// Empty event, continue reading
-	return nil, nil
 }
